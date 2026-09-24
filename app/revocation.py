@@ -316,6 +316,25 @@ class RevocationEngine:
             return rc, None
         return None, "responder_identity_unresolved"
 
+    @staticmethod
+    def _ocsp_effective_status(single, t: int) -> str:
+        """Status at the historical signed_at instant (§4 timelines): a
+        revocation dated after signed_at is not yet effective."""
+        if (single.status == "REVOKED"
+                and single.revocation_time is not None
+                and single.revocation_time > t):
+            return "GOOD"
+        return single.status
+
+    @staticmethod
+    def _ocsp_single_tie(single):
+        """Encoding-independent ordering for duplicate same-CertID entries."""
+        return (single.this_update,
+                single.next_update if single.next_update is not None else -1,
+                single.status,
+                single.revocation_time if single.revocation_time is not None else -1,
+                single.reason or "")
+
     def _eval_ocsp(self, cert: ParsedCert, considered: list[dict]) -> dict | None:
         t = self.signed_at
         usable = []
@@ -323,8 +342,11 @@ class RevocationEngine:
         crypto_failures = 0
         stale_any = False
         for resp in self.ocsps.values():
-            single = resp.responses.get(cert.serial)
-            if single is None:
+            # A batch OCSP response may contain several SingleResponses with
+            # the same serial number for distinct issuers; select by the full
+            # CertID (recomputed name/key hashes), never by serial alone.
+            singles = [s for s in resp.responses if s.serial == cert.serial]
+            if not singles:
                 continue
             considered.append({
                 "kind": "ocsp", "fingerprint": resp.fingerprint,
@@ -337,11 +359,31 @@ class RevocationEngine:
             if resp.received_at > self.cutoff:
                 continue
             scope_candidates += 1
-            issuer = self._ocsp_match(resp, cert, single)
-            if issuer is None:
+            matched = []  # (SingleResponse, issuer cert) for THIS cert's issuer
+            for single in singles:
+                ic = self._ocsp_match(resp, cert, single)
+                if ic is not None:
+                    matched.append((single, ic))
+            if not matched:
+                # No serial-matching entry certifies this certificate's issuer
+                # (a same-serial entry for another issuer is simply out of
+                # scope for this cert, not evidence against it).
                 crypto_failures += 1
                 self._mark(considered, resp.fingerprint, "certid_does_not_match_issuer")
                 continue
+            # Every matched entry targets the same full CertID (target issuer
+            # name+key + serial). A signed response that asserts conflicting
+            # certStatus values for one CertID is self-contradictory and must
+            # be rejected as ambiguous regardless of entry encoding order.
+            statuses = {s.status for s, _ic in matched}
+            if len(statuses) > 1:
+                crypto_failures += 1
+                self._mark(considered, resp.fingerprint,
+                           "conflicting_status_for_certid")
+                continue
+            # Responder authorization and TBS signature are properties of the
+            # whole response; validate once against the matched issuer.
+            issuer = matched[0][1]
             responder, reason = self._ocsp_responder(resp, issuer)
             if responder is None:
                 crypto_failures += 1
@@ -352,35 +394,56 @@ class RevocationEngine:
                 crypto_failures += 1
                 self._mark(considered, resp.fingerprint, "signature_unverified")
                 continue
-            effective_revoked = (single.status == "REVOKED"
-                                 and single.revocation_time is not None
-                                 and single.revocation_time <= t)
-            later_revocation = (single.status == "REVOKED"
-                                and single.revocation_time is not None
-                                and single.revocation_time > t)
-            window_ok = single.this_update <= t and (
-                single.next_update is None or t <= single.next_update)
-            if not effective_revoked and not window_ok:
+
+            # Same raw certStatus can still be historically contradictory:
+            # two REVOKED entries with different revocation times can place
+            # the revocation on opposite sides of signed_at.
+            if len({self._ocsp_effective_status(s, t) for s, _ic in matched}) > 1:
+                crypto_failures += 1
+                self._mark(considered, resp.fingerprint,
+                           "conflicting_status_for_certid")
+                continue
+            resp_used = False
+            resp_stale = False
+            for single, _ic in matched:
+                effective_revoked = (single.status == "REVOKED"
+                                     and single.revocation_time is not None
+                                     and single.revocation_time <= t)
+                later_revocation = (single.status == "REVOKED"
+                                    and single.revocation_time is not None
+                                    and single.revocation_time > t)
+                window_ok = single.this_update <= t and (
+                    single.next_update is None or t <= single.next_update)
+                if not effective_revoked and not window_ok:
+                    resp_stale = True
+                    continue
+                if later_revocation:
+                    status = "GOOD"  # revocation event is after the signing time
+                else:
+                    status = single.status
+                resp_used = True
+                usable.append({
+                    "generation": single.this_update,
+                    "kind_rank": 0,
+                    "fingerprint": resp.fingerprint,
+                    "status": status,
+                    "entry": single,
+                    "responder": responder.fingerprint,
+                    "tie": self._ocsp_single_tie(single),
+                })
+            if resp_used:
+                self._mark(considered, resp.fingerprint, "USED", decision="USED")
+            elif resp_stale:
                 stale_any = True
                 self._mark(considered, resp.fingerprint, "stale_at_signed_at")
-                continue
-            if later_revocation:
-                status = "GOOD"  # revocation event is after the signing time
-            else:
-                status = single.status
-            self._mark(considered, resp.fingerprint, "USED", decision="USED")
-            usable.append({
-                "generation": single.this_update,
-                "kind_rank": 0,
-                "fingerprint": resp.fingerprint,
-                "status": status,
-                "entry": single,
-                "responder": responder.fingerprint,
-            })
         if not usable:
             return {"scope_candidates": scope_candidates,
                     "crypto_failures": crypto_failures, "stale": stale_any}
-        usable.sort(key=lambda u: (-u["generation"], u["kind_rank"], u["fingerprint"]))
+        # Newest generation wins, then OCSP rank, then evidence fingerprint;
+        # within one response the tie key keeps duplicate same-CertID entries
+        # independent of their encoding order.
+        usable.sort(key=lambda u: (
+            -u["generation"], u["kind_rank"], u["fingerprint"], u["tie"]))
         return {"best": usable[0]}
 
     # --------------------------------------------------------- public API

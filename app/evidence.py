@@ -88,8 +88,12 @@ class OcspObject:
     sig_oid: str
     responder_name_der: bytes | None
     responder_key_hash: bytes | None
-    # serial -> single response
-    responses: dict[int, "SingleOcsp"]
+    # All SingleResponse entries in encoding order. A batch response may
+    # legitimately carry the same serial for two DIFFERENT issuers (the full
+    # CertID also includes nameHash/keyHash), so this must stay a list rather
+    # than a serial-keyed map; exact-CertID collisions are adjudicated in the
+    # revocation engine.
+    responses: list["SingleOcsp"]
     # embedded delegated-responder certs (DER)
     embedded_certs: tuple[bytes, ...]
 
@@ -349,7 +353,7 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
     elif ocsp_params not in (None, b""):
         raise UnsupportedError("OCSP: unexpected signature parameters")
 
-    singles: dict[int, SingleOcsp] = {}
+    singles: list[SingleOcsp] = []
     # cryptography exposes ``responses`` as a one-shot Rust iterator; consume
     # it exactly once into a materialized list.
     raw_singles = list(resp.responses)
@@ -369,7 +373,7 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
         alg_name = sr.hash_algorithm.name
         if alg_name not in ("sha1", "sha256", "sha384", "sha512"):
             raise UnsupportedError("OCSP certID hash outside profile", {"hash": alg_name})
-        singles[sr.serial_number] = SingleOcsp(
+        singles.append(SingleOcsp(
             serial=sr.serial_number,
             hash_alg=alg_name,
             issuer_name_hash=sr.issuer_name_hash,
@@ -379,7 +383,7 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
             reason=reason,
             this_update=int(sr.this_update_utc.timestamp()),
             next_update=int(sr.next_update_utc.timestamp()) if sr.next_update_utc else None,
-        )
+        ))
 
     from cryptography.hazmat.primitives.serialization import Encoding
 

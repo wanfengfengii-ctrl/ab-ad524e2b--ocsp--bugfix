@@ -279,3 +279,119 @@ def build_ocsp(leaf_cert, issuer_cert, issuer_key, status, *,
     if isinstance(sign_key, ed25519.Ed25519PrivateKey):
         return builder.sign(sign_key, None)
     return builder.sign(sign_key, hashes.SHA256())
+
+
+def _spki_key_bits(cert_or_pub) -> bytes:
+    """Contents of the subjectPublicKey BIT STRING (key material only)."""
+    from app import der
+
+    pub = cert_or_pub.public_key() if hasattr(cert_or_pub, "public_key") \
+        else cert_or_pub
+    spki = pub.public_bytes(serialization.Encoding.DER,
+                            serialization.PublicFormat.SubjectPublicKeyInfo)
+    _t, spki_body, _ = der.tlv(spki)
+    parts = list(der.iter_tlv(spki_body))
+    _alg_tag, _alg_val, bitstring = parts[0][0], parts[0][1], parts[1][1]
+    return bitstring[1:]  # strip unused-bits octet
+
+
+def build_batch_ocsp(entries, *, sign_key, responder_name_cert=None,
+                     responder_key_cert=None, sig_alg="sha256",
+                     embedded_certs=()):
+    """Build a BasicOCSPResponse carrying several SingleResponses.
+
+    ``entries`` is a list of kwargs for :func:`build_ocsp` (minus the
+    responder overrides). Batching is needed because two entries may share a
+    serial while targeting different issuers — cryptography's high-level
+    builder only allows one response, so each single is generated separately
+    and the responseData is reassembled and re-signed once.
+
+    The responder is identified either byName (``responder_name_cert``) or
+    byKey SHA-1 of the SPKI BIT STRING (``responder_key_cert``, per RFC 6960
+    §4.2.2.3 — the key itself, not the SKI extension).
+    """
+    import hashlib
+
+    from app import der
+
+    if responder_name_cert is not None:
+        name_der = responder_name_cert.subject.public_bytes()
+        responder_tlv = der.build_tlv(0xA1, name_der)
+    elif responder_key_cert is not None:
+        key_bits = _spki_key_bits(responder_key_cert)
+        responder_tlv = der.build_tlv(
+            0xA2, der.build_tlv(der.OCTET_STRING, hashlib.sha1(key_bits).digest()))
+    else:
+        raise ValueError("responder_name_cert or responder_key_cert required")
+
+    singles_der = b""
+    alg_tlv = None
+    version_tlv = None
+    produced_tlv = None
+    for e in entries:
+        # Each constituent single is produced with a responder certificate
+        # whose public key equals ``sign_key`` (a delegated cert chaining to
+        # that single's issuer); the responderId/embedded-certs are replaced
+        # during reassembly below.
+        entry_responder_cert = e.pop("responder_cert", responder_name_cert)
+        one = build_ocsp(responder_key=sign_key,
+                         responder_cert=entry_responder_cert,
+                         sig_alg=sig_alg, **e)
+        raw = one.public_bytes(serialization.Encoding.DER)
+        _t, outer, _ = der.tlv(raw)
+        # responseBytes [0] EXPLICIT contains the ResponseBytes SEQUENCE.
+        rb = list(der.iter_tlv(outer))[1][1]
+        _t2, rb_body, _ = der.tlv(rb)
+        rb_parts = list(der.iter_tlv(rb_body))
+        basic = der.tlv(rb_parts[1][1])[1]
+        bparts = list(der.iter_tlv(basic))
+        if alg_tlv is None:
+            alg_tlv = der.build_tlv(bparts[1][0], bparts[1][1])
+            tbs_parts = list(der.iter_tlv(bparts[0][1]))
+            for tag, val in tbs_parts:
+                if tag == 0xA0:
+                    version_tlv = der.build_tlv(tag, val)
+                elif tag in (0x17, 0x18):
+                    produced_tlv = der.build_tlv(tag, val)
+        tbs_parts = list(der.iter_tlv(bparts[0][1]))
+        for tag, val in tbs_parts:
+            if tag == der.SEQUENCE:
+                singles_der += val  # body of the responses SEQUENCE
+                break
+
+    responses_tlv = der.build_tlv(der.SEQUENCE, singles_der)
+    tbs_body = b""
+    if version_tlv is not None:
+        tbs_body += version_tlv
+    tbs_body += responder_tlv + produced_tlv + responses_tlv
+    tbs = der.build_tlv(der.SEQUENCE, tbs_body)
+
+    if sig_alg == "pss":
+        sig = sign_key.sign(
+            tbs,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                        salt_length=hashes.SHA256().digest_size),
+            hashes.SHA256())
+    elif isinstance(sign_key, ed25519.Ed25519PrivateKey):
+        sig = sign_key.sign(tbs)
+    elif isinstance(sign_key, rsa.RSAPrivateKey):
+        sig = sign_key.sign(tbs, padding.PKCS1v15(), hashes.SHA256())
+    else:
+        sig = sign_key.sign(tbs, ec.ECDSA(hashes.SHA256()))
+    sig_tlv = der.build_tlv(der.BIT_STRING, b"\x00" + sig)
+
+    basic_body = tbs + alg_tlv + sig_tlv
+    if embedded_certs:
+        certs_der = b"".join(
+            c.public_bytes(serialization.Encoding.DER) for c in embedded_certs)
+        basic_body += der.build_tlv(
+            0xA0, der.build_tlv(der.SEQUENCE, certs_der))
+    basic = der.build_tlv(der.SEQUENCE, basic_body)
+
+    oid_basic = bytes([0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01])
+    rb_body = (der.build_tlv(der.OID, oid_basic)
+               + der.build_tlv(der.OCTET_STRING, basic))
+    response_bytes = der.build_tlv(0xA0, der.build_tlv(der.SEQUENCE, rb_body))
+    # responseStatus ENUMERATED successful(0)
+    status = bytes([0x0A, 0x01, 0x00])
+    return der.build_tlv(der.SEQUENCE, status + response_bytes)
