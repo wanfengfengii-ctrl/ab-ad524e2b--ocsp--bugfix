@@ -88,14 +88,18 @@ class OcspObject:
     sig_oid: str
     responder_name_der: bytes | None
     responder_key_hash: bytes | None
-    # serial -> single response
-    responses: dict[int, "SingleOcsp"]
+    # All SingleResponse entries in DER encoding order. A batch OCSP response
+    # legitimately contains several entries, and two of them may share a
+    # serial while naming different issuers — serial alone is therefore not a
+    # safe key. Matching is done cryptographically against the full CertID.
+    responses: tuple["SingleOcsp", ...]
     # embedded delegated-responder certs (DER)
     embedded_certs: tuple[bytes, ...]
 
 
 @dataclasses.dataclass
 class SingleOcsp:
+    index: int  # position in the response's SEQUENCE OF SingleResponse
     serial: int
     hash_alg: str
     issuer_name_hash: bytes
@@ -349,11 +353,11 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
     elif ocsp_params not in (None, b""):
         raise UnsupportedError("OCSP: unexpected signature parameters")
 
-    singles: dict[int, SingleOcsp] = {}
+    singles: list[SingleOcsp] = []
     # cryptography exposes ``responses`` as a one-shot Rust iterator; consume
     # it exactly once into a materialized list.
     raw_singles = list(resp.responses)
-    for sr in raw_singles:
+    for idx, sr in enumerate(raw_singles):
         status = {
             ocsp.OCSPCertStatus.GOOD: "GOOD",
             ocsp.OCSPCertStatus.REVOKED: "REVOKED",
@@ -369,7 +373,8 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
         alg_name = sr.hash_algorithm.name
         if alg_name not in ("sha1", "sha256", "sha384", "sha512"):
             raise UnsupportedError("OCSP certID hash outside profile", {"hash": alg_name})
-        singles[sr.serial_number] = SingleOcsp(
+        singles.append(SingleOcsp(
+            index=idx,
             serial=sr.serial_number,
             hash_alg=alg_name,
             issuer_name_hash=sr.issuer_name_hash,
@@ -379,7 +384,7 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
             reason=reason,
             this_update=int(sr.this_update_utc.timestamp()),
             next_update=int(sr.next_update_utc.timestamp()) if sr.next_update_utc else None,
-        )
+        ))
 
     from cryptography.hazmat.primitives.serialization import Encoding
 
@@ -391,7 +396,7 @@ def parse_ocsp(raw: bytes, received_at: int) -> OcspObject:
         sig_oid=sig_oid,
         responder_name_der=resp.responder_name.public_bytes() if resp.responder_name else None,
         responder_key_hash=resp.responder_key_hash,
-        responses=singles,
+        responses=tuple(singles),
         embedded_certs=embedded,
     )
 

@@ -411,3 +411,180 @@ def test_stale_evidence_when_window_expired(tmp_path):
     assert res["verdict"]["status"] == "REJECTED"
     snap = {x["certificate"]: x for x in res["revocation_snapshot"]}
     assert snap[fp_of(pf.der(leaf))]["conclusion"] == "STALE"
+
+
+class BatchOcspHarness(Harness):
+    """Two differently named CAs sharing one signing key; the target leaf and
+    an unrelated leaf share one serial."""
+
+    def __init__(self, tmp_path):
+        from cryptography.hazmat.primitives import hashes as H
+        super().__init__(tmp_path)
+        rk, ck, lk, l2k = pf.gen_key(), pf.gen_key(), pf.gen_key(), pf.gen_key()
+        self.ck, self.lk = ck, lk
+        self.root = pf.build_cert(
+            "Batch R", None, rk, rk, is_ca=True,
+            key_usage=("keyCertSign", "cRLSign"), policies=[ANY], self_signed=True)
+        self.ca1 = pf.build_cert(
+            "Batch CA One", self.root, ck, rk, is_ca=True,
+            key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+        self.ca2 = pf.build_cert(
+            "Batch CA Two", self.root, ck, rk, is_ca=True,
+            key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+        assert self.ca1.subject != self.ca2.subject
+        assert (self.ca1.public_key().public_numbers()
+                == self.ca2.public_key().public_numbers())
+        serial = 0x0BADF00D12345678
+        self.leaf = pf.build_cert(
+            "batch-leaf.test", self.ca1, lk, ck, serial=serial,
+            key_usage=("digitalSignature",), eku=("codeSigning",),
+            policies=[ANY], san_dns=("batch-leaf.test",))
+        self.other = pf.build_cert(
+            "batch-other.test", self.ca2, l2k, ck, serial=serial,
+            key_usage=("digitalSignature",), eku=("codeSigning",),
+            policies=[ANY], san_dns=("batch-other.test",))
+        self.rcrl = pf.build_crl(
+            self.root, rk, [], last_update=SIGNED - 100,
+            next_update=SIGNED + 100, crl_number=1)
+        self.hash_alg = H.SHA256()
+
+    def good_entry(self):
+        return dict(cert=self.leaf, issuer=self.ca1, status="good",
+                    this_update=SIGNED - 100, next_update=SIGNED + 100,
+                    hash_alg=self.hash_alg)
+
+    def unknown_entry(self):
+        return dict(cert=self.other, issuer=self.ca2, status="unknown",
+                    this_update=SIGNED - 100, next_update=SIGNED + 100,
+                    hash_alg=self.hash_alg)
+
+    def revoked_entry(self):
+        return dict(cert=self.leaf, issuer=self.ca1, status="revoked",
+                    this_update=SIGNED - 100, next_update=SIGNED + 100,
+                    revocation_time=SIGNED - 1000,
+                    reason="key_compromise", hash_alg=self.hash_alg)
+
+    def seal_with(self, ocsp_obj):
+        for c in (self.root, self.ca1, self.ca2, self.leaf):
+            self.add_cert(c)
+        self.add_rev(self.rcrl, 0)
+        self.add_rev(ocsp_obj, 1, kind="ocsp")
+        return self.seal()
+
+    def judge_leaf(self):
+        return self.judge(self.leaf, fp_of(pf.der(self.root)), self.lk)
+
+    def batch(self, entries):
+        return pf.build_ocsp_batch(
+            entries, sign_key=self.ck, produced_at=SIGNED - 90,
+            responder_cert=self.ca1)
+
+
+def test_batch_ocsp_cross_issuer_same_serial_good_first(tmp_path):
+    """GOOD entry for the target issuer ahead of an UNKNOWN entry for another
+    issuer with the same serial must establish GOOD (regression: the parser
+    collapsed entries by serial, so encoding order decided the result)."""
+    h = BatchOcspHarness(tmp_path)
+    h.seal_with(h.batch([h.good_entry(), h.unknown_entry()]))
+    res = h.judge_leaf()
+    assert res["verdict"]["status"] == "VALID", res["verdict"]
+    snap = {x["certificate"]: x for x in res["revocation_snapshot"]}
+    rr = snap[fp_of(pf.der(h.leaf))]
+    assert rr["conclusion"] == "GOOD"
+    assert rr["ambiguity"] is None
+    used = [c for c in rr["considered_evidence"] if c["decision"] == "USED"]
+    assert len(used) == 1
+
+
+def test_batch_ocsp_cross_issuer_same_serial_good_last(tmp_path):
+    """Same conclusion regardless of where the target issuer's entry sits."""
+    h = BatchOcspHarness(tmp_path)
+    h.seal_with(h.batch([h.unknown_entry(), h.good_entry()]))
+    res = h.judge_leaf()
+    assert res["verdict"]["status"] == "VALID", res["verdict"]
+    snap = {x["certificate"]: x for x in res["revocation_snapshot"]}
+    assert snap[fp_of(pf.der(h.leaf))]["conclusion"] == "GOOD"
+
+
+def test_batch_ocsp_single_entry_unchanged(tmp_path):
+    """A single-entry batch response keeps the original GOOD behavior."""
+    h = BatchOcspHarness(tmp_path)
+    h.seal_with(h.batch([h.good_entry()]))
+    res = h.judge_leaf()
+    assert res["verdict"]["status"] == "VALID"
+    rr = res["revocation_results"][0]
+    assert rr["conclusion"] == "GOOD"
+    assert rr["selected_evidence"]["single_response_index"] == 0
+
+
+def test_batch_ocsp_same_certid_conflict_is_stable(tmp_path):
+    """Two entries attesting to one complete CertID with conflicting statuses
+    must be reported as ambiguity in both encoding orders — never picking one
+    by DER order."""
+    h = BatchOcspHarness(tmp_path)
+    for c in (h.root, h.ca1, h.ca2, h.leaf):
+        h.add_cert(c)
+    h.add_rev(h.rcrl, 0)
+    good, revoked = h.good_entry(), h.revoked_entry()
+    orders = [
+        ("es_conf_a_000000000000000000000001", [good, revoked]),
+        ("es_conf_b_000000000000000000000002", [revoked, good]),
+    ]
+    conclusions = []
+    details = []
+    artifact = b"artifact"
+    for sid, entries in orders:
+        h.store.create_set(sid, f"create-{sid}")
+        oc = h.batch(entries)
+        d = pf.der(oc)
+        h.store.put_blob(d)
+        rows = [{"client_ref": f"oc-{sid}", "kind": "ocsp",
+                 "content_sha256": fp_of(d), "received_at": RECEIVED}]
+        # Reuse the already-stored cert/CRL blobs via a second set's items.
+        for c in (h.root, h.ca1, h.ca2, h.leaf):
+            cd = pf.der(c)
+            rows.append({"client_ref": f"c-{sid}-{fp_of(cd)[:8]}",
+                         "kind": "certificate", "content_sha256": fp_of(cd),
+                         "received_at": RECEIVED})
+        cd = pf.der(h.rcrl)
+        rows.append({"client_ref": f"crl-{sid}", "kind": "crl",
+                     "content_sha256": fp_of(cd), "received_at": RECEIVED})
+        h.store.add_items(sid, rows)
+        h.store.seal(sid)
+        dig, sig, alg = _sig(h.lk, artifact)
+        res = adjudicate(h.store, sid, {
+            "artifact_digest": dig.hex(), "signature": sig.hex(),
+            "signature_algorithm": alg, "signed_at": SIGNED,
+            "knowledge_cutoff": CUTOFF,
+            "leaf_certificate_sha256": fp_of(pf.der(h.leaf)),
+            "initial_policies": [ANY],
+            "trust_anchors": [fp_of(pf.der(h.root))]})
+        assert res["verdict"]["status"] == "REJECTED", res["verdict"]
+        assert res["verdict"]["failed_rule"] == "REVOCATION"
+        snap = {x["certificate"]: x for x in res["revocation_snapshot"]}
+        rr = snap[fp_of(pf.der(h.leaf))]
+        conclusions.append(rr["conclusion"])
+        details.append(rr["ambiguity"])
+        assert any(c["reason"] == "conflicting_status_for_same_certid"
+                   for c in rr["considered_evidence"])
+    assert conclusions == ["MALFORMED_EVIDENCE", "MALFORMED_EVIDENCE"]
+    assert details[0] is not None and details[1] is not None
+    assert details[0]["kind"] == "ocsp_conflicting_status_for_same_certid"
+    assert details[0]["statuses"] == ["GOOD", "REVOKED"]
+    # Same complete CertID (shared PKI) in both orders; only the evidence
+    # bytes differ because of encoding order.
+    assert details[0]["certid"] == details[1]["certid"]
+    assert details[0]["evidence_fingerprint"] != details[1]["evidence_fingerprint"]
+
+
+def test_batch_ocsp_good_package_offline_verifies(tmp_path):
+    """The cross-issuer batch GOOD adjudication survives an offline rerun."""
+    h = BatchOcspHarness(tmp_path)
+    manifest = h.seal_with(h.batch([h.good_entry(), h.unknown_entry()]))
+    res = h.judge_leaf()
+    assert res["verdict"]["status"] == "VALID"
+    pkg = build_package(h.store, res, manifest)
+    path = tmp_path / "batch-good.zip"
+    path.write_bytes(pkg)
+    report = verify_package(str(path))
+    assert report["ok"], [c for c in report["checks"] if not c["ok"]]

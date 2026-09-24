@@ -69,6 +69,7 @@ class RevocationEngine:
         self.signed_at = signed_at
         self.cutoff = cutoff
         self._cache: dict[str, dict] = {}
+        self._ocsp_sig_cache: dict[tuple[str, str], bool] = {}
 
     # -------------------------------------------------- signer resolution
     def _issuer_certs(self, name_der: bytes, ski: bytes | None) -> list[ParsedCert]:
@@ -262,12 +263,39 @@ class RevocationEngine:
         if single.serial != cert.serial:
             return None
         # Find issuer identities (name + key) and recompute certID hashes.
+        # The serial alone is not an identity: a batch response may carry the
+        # same serial under two different issuers, so both CertID hashes must
+        # match the certificate's actual issuer.
         issuers = self._issuer_certs(cert.issuer_der, cert.aki)
         for ic in issuers:
             nh, kh = ev.certid_hashes(ic.subject_der, ic.spki_bitstring, single.hash_alg)
             if nh == single.issuer_name_hash and kh == single.issuer_key_hash:
                 return ic
         return None
+
+    @staticmethod
+    def _ocsp_effective_status(single: ev.SingleOcsp, t: int) -> tuple[str | None, bool]:
+        """Reduce a single response to its decisive status at ``signed_at``.
+
+        Returns ``(status, window_required_failed)``: a later-than-signed_at
+        revocation reads GOOD (and is decisive regardless of freshness); a
+        GOOD/UNKNOWN/past-revocation entry needs a current validity window.
+        """
+        effective_revoked = (single.status == "REVOKED"
+                             and single.revocation_time is not None
+                             and single.revocation_time <= t)
+        later_revocation = (single.status == "REVOKED"
+                            and single.revocation_time is not None
+                            and single.revocation_time > t)
+        window_ok = single.this_update <= t and (
+            single.next_update is None or t <= single.next_update)
+        if effective_revoked:
+            return "REVOKED", False
+        if later_revocation:
+            return "GOOD", False
+        if not window_ok:
+            return None, True
+        return single.status, False
 
     def _ocsp_responder(self, resp: ev.OcspObject, issuer: ParsedCert):
         """Validate direct-CA or delegated responder; return (ok, reason)."""
@@ -316,15 +344,29 @@ class RevocationEngine:
             return rc, None
         return None, "responder_identity_unresolved"
 
+    def _verify_ocsp_cached(self, resp: ev.OcspObject, responder: ParsedCert) -> bool:
+        """The response TBS signature is identical for every entry; verify it
+        once per (response, responder key)."""
+        key = (resp.fingerprint, responder.fingerprint)
+        cached = self._ocsp_sig_cache.get(key)
+        if cached is None:
+            cached, _err = ev.verify_ocsp_signature(resp, responder.cert.public_key())
+            self._ocsp_sig_cache[key] = cached
+        return cached
+
     def _eval_ocsp(self, cert: ParsedCert, considered: list[dict]) -> dict | None:
         t = self.signed_at
         usable = []
+        conflicts = []  # responses whose own entries disagree on one CertID
         scope_candidates = 0
         crypto_failures = 0
         stale_any = False
         for resp in self.ocsps.values():
-            single = resp.responses.get(cert.serial)
-            if single is None:
+            # A batch response may contain several entries with this serial
+            # (for distinct issuers); evaluate each against the full CertID
+            # rather than taking a serial-keyed dict slot.
+            matching = [s for s in resp.responses if s.serial == cert.serial]
+            if not matching:
                 continue
             considered.append({
                 "kind": "ocsp", "fingerprint": resp.fingerprint,
@@ -337,51 +379,102 @@ class RevocationEngine:
             if resp.received_at > self.cutoff:
                 continue
             scope_candidates += 1
-            issuer = self._ocsp_match(resp, cert, single)
-            if issuer is None:
+            # Resolve every matching entry to this certificate's issuer via
+            # its complete CertID, keying by actual issuer identity so two
+            # hash-algorithm spellings of one issuer collapse together.
+            resolved = []  # (single, issuer, identity)
+            for single in matching:
+                issuer = self._ocsp_match(resp, cert, single)
+                if issuer is not None:
+                    identity = (issuer.subject_der, issuer.spki_bitstring)
+                    resolved.append((single, issuer, identity))
+            if not resolved:
                 crypto_failures += 1
                 self._mark(considered, resp.fingerprint, "certid_does_not_match_issuer")
                 continue
-            responder, reason = self._ocsp_responder(resp, issuer)
-            if responder is None:
+            # Authorize the responder and verify the TBS signature per entry;
+            # a batch response is only authoritative for an entry when signed
+            # by a key authorized for that entry's issuer.
+            valid = []  # (single, issuer, identity, responder)
+            fail_reason = "responder_identity_unresolved"
+            for single, issuer, identity in resolved:
+                responder, reason = self._ocsp_responder(resp, issuer)
+                if responder is None:
+                    fail_reason = reason
+                    continue
+                if not self._verify_ocsp_cached(resp, responder):
+                    fail_reason = "signature_unverified"
+                    continue
+                valid.append((single, issuer, identity, responder))
+            if not valid:
                 crypto_failures += 1
-                self._mark(considered, resp.fingerprint, reason)
+                self._mark(considered, resp.fingerprint, fail_reason)
                 continue
-            ok, _err = ev.verify_ocsp_signature(resp, responder.cert.public_key())
-            if not ok:
-                crypto_failures += 1
-                self._mark(considered, resp.fingerprint, "signature_unverified")
-                continue
-            effective_revoked = (single.status == "REVOKED"
-                                 and single.revocation_time is not None
-                                 and single.revocation_time <= t)
-            later_revocation = (single.status == "REVOKED"
-                                and single.revocation_time is not None
-                                and single.revocation_time > t)
-            window_ok = single.this_update <= t and (
-                single.next_update is None or t <= single.next_update)
-            if not effective_revoked and not window_ok:
-                stale_any = True
+            # Apply the bitemporal window and group decisive entries by the
+            # issuer identity they actually attest to.
+            decisions = []  # (identity, status, single, responder)
+            for single, issuer, identity, responder in valid:
+                status, stale = self._ocsp_effective_status(single, t)
+                if stale:
+                    stale_any = True
+                    continue
+                decisions.append((identity, status, single, responder))
+            if not decisions:
                 self._mark(considered, resp.fingerprint, "stale_at_signed_at")
                 continue
-            if later_revocation:
-                status = "GOOD"  # revocation event is after the signing time
-            else:
-                status = single.status
+            by_identity: dict[tuple, list] = {}
+            for identity, status, single, responder in decisions:
+                by_identity.setdefault(identity, []).append(
+                    (status, single, responder))
+            conflicting = False
+            for identity, entries in by_identity.items():
+                statuses = {st for st, _s, _r in entries}
+                if len(statuses) > 1:
+                    # Two entries in ONE response attest to the same complete
+                    # CertID yet disagree: encoding order must never pick a
+                    # winner. The whole response is unreliable.
+                    conflicting = True
+                    conflicts.append({
+                        "generation": max(s.this_update for _st, s, _r in entries),
+                        "fingerprint": resp.fingerprint,
+                        "statuses": sorted(statuses),
+                        "certid": {
+                            "serial": cert.serial,
+                            "issuer_name_sha256": hashlib.sha256(
+                                identity[0]).hexdigest(),
+                            "issuer_key_sha256": hashlib.sha256(
+                                identity[1]).hexdigest(),
+                        },
+                    })
+                    break
+            if conflicting:
+                self._mark(considered, resp.fingerprint,
+                           "conflicting_status_for_same_certid")
+                continue
+            # Agreeing duplicates (same issuer identity, same status) all stay
+            # admissible; the deterministic selection sorts them out.
+            for identity, entries in by_identity.items():
+                for status, single, responder in entries:
+                    usable.append({
+                        "generation": single.this_update,
+                        "kind_rank": 0,
+                        "fingerprint": resp.fingerprint,
+                        "entry_index": single.index,
+                        "status": status,
+                        "entry": single,
+                        "responder": responder.fingerprint,
+                    })
             self._mark(considered, resp.fingerprint, "USED", decision="USED")
-            usable.append({
-                "generation": single.this_update,
-                "kind_rank": 0,
-                "fingerprint": resp.fingerprint,
-                "status": status,
-                "entry": single,
-                "responder": responder.fingerprint,
-            })
-        if not usable:
-            return {"scope_candidates": scope_candidates,
-                    "crypto_failures": crypto_failures, "stale": stale_any}
-        usable.sort(key=lambda u: (-u["generation"], u["kind_rank"], u["fingerprint"]))
-        return {"best": usable[0]}
+        result = {"scope_candidates": scope_candidates,
+                  "crypto_failures": crypto_failures, "stale": stale_any}
+        if conflicts:
+            conflicts.sort(key=lambda c: (-c["generation"], c["fingerprint"]))
+            result["conflict"] = conflicts[0]
+        if usable:
+            usable.sort(key=lambda u: (-u["generation"], u["kind_rank"],
+                                       u["fingerprint"], u["entry_index"]))
+            result["best"] = usable[0]
+        return result
 
     # --------------------------------------------------------- public API
     def evaluate(self, cert: ParsedCert) -> dict:
@@ -402,6 +495,7 @@ class RevocationEngine:
         else:
             ocsp_fail = ocsp_res
 
+        ambiguity = None
         if best:
             best.sort(key=lambda u: (-u["generation"], u["kind_rank"], u["fingerprint"]))
             win = best[0]
@@ -412,6 +506,8 @@ class RevocationEngine:
                 "generation_time": win["generation"],
                 "signer": win.get("responder") or win.get("signer"),
             }
+            if win["kind_rank"] == 0 and "entry_index" in win:
+                selected["single_response_index"] = win["entry_index"]
             if "base" in win:
                 selected["base"] = win["base"]
                 selected["delta"] = win["delta"]
@@ -425,7 +521,20 @@ class RevocationEngine:
             scope_total = sum(f.get("scope_candidates", 0) for f in fails)
             crypto_total = sum(f.get("crypto_failures", 0) for f in fails)
             stale_total = sum(1 for f in fails if f.get("stale"))
-            if scope_total == 0:
+            conflict = next((f.get("conflict") for f in fails if f.get("conflict")),
+                            None)
+            if conflict is not None:
+                # A signed response contradicts itself for one complete
+                # CertID: no status can be adopted, and the result must not
+                # depend on which entry happened to be encoded first.
+                conclusion = "MALFORMED_EVIDENCE"
+                ambiguity = {
+                    "kind": "ocsp_conflicting_status_for_same_certid",
+                    "evidence_fingerprint": conflict["fingerprint"],
+                    "statuses": conflict["statuses"],
+                    "certid": conflict["certid"],
+                }
+            elif scope_total == 0:
                 conclusion = "UNKNOWN"
             elif stale_total and crypto_total == 0 and scope_total <= stale_total:
                 conclusion = "STALE"
@@ -456,6 +565,7 @@ class RevocationEngine:
             "revocation_reason": reason,
             "selected_evidence": selected,
             "considered_evidence": considered,
+            "ambiguity": ambiguity,
             "timelines": {
                 "signed_at": self.signed_at,
                 "knowledge_cutoff": self.cutoff,

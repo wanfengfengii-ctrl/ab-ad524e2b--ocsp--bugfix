@@ -186,6 +186,17 @@ certID 不匹配、scope 不符、窗口过期等）。
 
 - certID 用签发者 Name DER 与 SubjectPublicKey 位串**重新计算**
   nameHash/keyHash（支持 SHA-1/256/384/512），密码学比对序列号。
+- 批量 OCSP 响应按 **DER 次序保留全部 SingleResponse**，逐项用完整 CertID
+  匹配：仅序列号相同不足以认定同一证书——两张证书可以序列号相同而签发者
+  不同（Name 不同、响应签名公钥可以共用）。目标签发者的条目排在首位或末位
+  结论一致；另一签发者、同序列号的条目对本证书不具 scope（certID 不匹配），
+  既不污染也不覆盖目标条目。
+- 同一响应内若有两个条目指向**完全相同的 CertID**（hash 算法、nameHash、
+  keyHash、序列号全同）却给出相互冲突的状态，则该响应自相矛盾，稳定报告
+  `MALFORMED_EVIDENCE`（`ambiguity.kind =
+  ocsp_conflicting_status_for_same_certid`），绝不按编码次序任选一项；
+  状态在 `signed_at` 等价（如 GOOD 与撤销时刻晚于 `signed_at` 的 REVOKED）
+  不视为冲突。
 - 直接 CA 响应：必须由签发该证书的 CA 私钥签署。
 - 委托响应者：内嵌响应者证书必须链到该 CA、含 `id-kp-OCSPSigning`、
   非 CA、具备 `digitalSignature`、在 `signed_at` 有效
